@@ -1,0 +1,9 @@
+[Unit]
+Description=Claude Telegram Memory Compact
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/claude
+ExecStart=/usr/local/bin/bun run /home/claude/.claude/channels/telegram/compact-job.ts
+Environment=HOME=/home/claude
+Environment=PATH=/usr/local/bin:/home/claude/.local/bin:/usr/bin:/bin

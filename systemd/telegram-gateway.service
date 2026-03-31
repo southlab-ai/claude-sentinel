@@ -1,0 +1,19 @@
+[Unit]
+Description=Claude Telegram Gateway
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/claude
+ExecStart=/usr/local/bin/bun run /home/claude/.claude/channels/telegram/gateway.ts
+Restart=always
+RestartSec=5
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Environment=HOME=/home/claude
+Environment=PATH=/usr/local/bin:/home/claude/.local/bin:/usr/bin:/bin
+EnvironmentFile=/home/claude/.claude/channels/telegram/gateway.env
+
+[Install]
+WantedBy=default.target
