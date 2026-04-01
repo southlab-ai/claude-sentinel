@@ -245,6 +245,8 @@ function spawnPersistentSession(fresh = false, contextMode: "full" | "light" | "
     "--output-format", "stream-json",
     "--verbose",
     "--channels", "plugin:telegram@claude-plugins-official",
+    "--model", "claude-opus-4-6[1m]",
+    "--effort", "high",
     "--dangerously-skip-permissions",
     "--fallback-model", "claude-opus-4-6",
   ];
@@ -638,7 +640,9 @@ Subagent received all WebSearch results 4 hours ago but never generated response
 
     const result = spawnSync("claude", [
       "-p", prompt,
-      "--dangerously-skip-permissions",
+      "--model", "claude-opus-4-6[1m]",
+    "--effort", "high",
+    "--dangerously-skip-permissions",
       "--output-format", "text",
       "--model", "claude-sonnet-4-6",
     ], {
@@ -946,7 +950,7 @@ async function run() {
           if (chatId) {
             tgFetch("sendMessage", {
               chat_id: chatId,
-              text: `Session: ${state.currentSessionId?.slice(0, 8) ?? "?"}\nUptime: ${uptimeMin}min\nStatus: ${status}\nModel: sonnet`,
+              text: `Session: ${state.currentSessionId?.slice(0, 8) ?? "?"}\nUptime: ${uptimeMin}min\nStatus: ${status}\nModel: opus-1m`,
             }).catch(() => {});
           }
         }
