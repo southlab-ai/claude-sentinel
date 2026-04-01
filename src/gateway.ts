@@ -697,6 +697,7 @@ Subagent received all WebSearch results 4 hours ago but never generated response
       const proc = spawnPersistentSession(false, "none");
       state.proc = proc;
       state.lastStartTime = Date.now();
+      state.lastActivityTime = Date.now();
       setupStreamParser(proc, state);
       setupExitHandler(proc, state);
 
@@ -1043,6 +1044,7 @@ async function run() {
           console.log("[gateway] Spawning persistent Claude session...");
           state.hitRateLimit = false;
           state.lastStartTime = Date.now();
+          state.lastActivityTime = Date.now();
 
           const proc = spawnPersistentSession(state.resumeFailed, state.nextContextMode);
           state.resumeFailed = false;
