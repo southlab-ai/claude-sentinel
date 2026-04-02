@@ -195,7 +195,7 @@ function buildContext(): string {
     } catch {}
   }
 
-  const messages = getLastMessages(20).reverse();
+  const messages = getLastMessages(30).reverse();
   if (messages.length > 0) {
     const formatted = messages
       .map((m) => {
@@ -235,7 +235,7 @@ function formatAsChannelTag(m: TelegramMessage): string {
 }
 
 // --- Spawn persistent Claude session ---
-// contextMode: "full" = identity + compact + 20 msgs (default)
+// contextMode: "full" = identity + compact + 30 msgs (default)
 //              "light" = last 5 msgs only (for clean resume after watchdog)
 //              "none" = no extra context (for resume-continue, session has everything)
 function spawnPersistentSession(fresh = false, contextMode: "full" | "light" | "none" = "full"): ChildProcess {
