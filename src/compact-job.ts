@@ -92,51 +92,51 @@ function main() {
   }
 
   // Build prompt
-  const prompt = `You are a memory consolidation system. You have two jobs:
+  const prompt = `Eres un sistema de consolidación de memoria. Tienes dos trabajos:
 
-1. COMPACT: Create a concise summary of conversations to provide context for future sessions.
-2. PERMANENT MEMORY: Identify valuable information to save as permanent Claude memory.
+1. COMPACT: Crear un resumen conciso de las conversaciones para dar contexto a futuras sesiones.
+2. MEMORIA PERMANENTE: Identificar información valiosa que debe guardarse como memoria permanente de Claude.
 
-${previousCompact ? `[Previous compact]\n${previousCompact}` : "[First consolidation - no previous compact]"}
+${previousCompact ? `[Compact anterior]\n${previousCompact}` : "[Primera consolidación - no hay compact anterior]"}
 
-[New messages since last consolidation]
+[Mensajes nuevos desde última consolidación]
 ${formatted}
 
-${existingMemories ? `[Already saved permanent memories]\n${existingMemories}` : "[No permanent memories yet]"}
+${existingMemories ? `[Memorias permanentes ya guardadas]\n${existingMemories}` : "[No hay memorias permanentes aún]"}
 
 ---
 
-PART 1 -- COMPACT (max 800 words):
-- Preserve important decisions and agreements
-- Keep context of ongoing projects/tasks
-- Discard ephemeral details already resolved
-- Integrate previous compact with new information
+PARTE 1 — COMPACT (máximo 800 palabras):
+- Preserve decisiones y acuerdos importantes
+- Mantenga contexto de proyectos/tareas en curso
+- Descarte detalles efímeros ya resueltos
+- Integre el compact anterior con la información nueva
 
-PART 2 -- PERMANENT MEMORIES:
-Analyze conversations and decide if information deserves permanent storage. Types:
+PARTE 2 — MEMORIAS PERMANENTES:
+Analiza las conversaciones y decide si hay información que merece guardarse permanentemente. Los tipos son:
 
-- **user**: Info about the user (role, preferences, knowledge, work style)
-- **feedback**: User corrections or validations on how to work ("don't do X", "this is good")
-- **project**: Architectural decisions, project context, infrastructure, important configs
-- **reference**: References to external resources (URLs, services, tools in use)
+- **user**: Información sobre el usuario (rol, preferencias, conocimientos, cómo le gusta trabajar)
+- **feedback**: Correcciones o validaciones del usuario sobre cómo trabajar ("no hagas X", "así está bien")
+- **project**: Decisiones arquitectónicas, contexto de proyectos, infraestructura, configuraciones importantes
+- **reference**: Referencias a recursos externos (URLs, servicios, herramientas que usa)
 
-Criteria:
-- Would this be useful in future conversations without prior context?
-- Is this a decision/preference that won't change soon?
-- Can it NOT be derived from code or git history?
-- Is it already saved? (check existing memories to avoid duplicates)
+Criterios para guardar:
+- ¿Es información que sería útil en conversaciones futuras sin contexto previo?
+- ¿Es una decisión o preferencia que no cambiará pronto?
+- ¿Es algo que no se puede derivar del código o git history?
+- ¿Ya está guardado? (revisa las memorias existentes para no duplicar)
 
-DO NOT save:
-- Debugging details already resolved
-- Casual conversations with no future value
-- Information already in existing memories
+NO guardes:
+- Detalles de debugging que ya se resolvieron
+- Conversaciones casuales sin valor futuro
+- Información que ya está en las memorias existentes
 
-If there's something to save, add at the end:
+Si hay algo que guardar, agrégalo al final así:
 MEMORIES_JSON
-[{"type": "user|feedback|project|reference", "name": "filename_no_spaces", "description": "short one-line description", "content": "detailed memory content"}]
+[{"type": "user|feedback|project|reference", "name": "nombre_archivo_sin_espacios", "description": "descripción corta en una línea", "content": "contenido detallado de la memoria"}]
 END_MEMORIES_JSON
 
-If nothing new deserves permanent memory, don't include the JSON block.`;
+Si no hay nada nuevo que merezca memoria permanente, no incluyas el bloque JSON.`;
 
   // Run claude -p
   const result = spawnSync(
