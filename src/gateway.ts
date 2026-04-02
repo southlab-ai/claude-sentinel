@@ -374,6 +374,7 @@ function handleStreamEvent(event: any, state: SupervisorState) {
     // Register commands in Telegram Bot API (auto-updates on plugin changes)
     const botCommands = [
       { command: "check", description: "Watchdog diagnostic" },
+      { command: "vpsstatus", description: "Quick VPS/session status" },
       ...cmds
         .filter((c: string) => !c.includes(":"))  // Telegram doesn't allow : in commands
         .slice(0, 99)  // Telegram max 100 commands
@@ -891,6 +892,8 @@ function setupExitHandler(proc: ChildProcess, state: SupervisorState) {
 async function run() {
   console.log("[gateway] Telegram Gateway started (persistent mode). Waiting for messages...");
 
+  const gatewayStartTime = Date.now();
+
   const state: SupervisorState = {
     proc: null,
     backoffMs: BACKOFF.initial,
@@ -980,6 +983,27 @@ async function run() {
           if (cmd === "check") {
             globalCheckRequested = true;
             setState("last_chat_id", msg.chatId);
+            continue;
+          }
+
+          // /vpsstatus is gateway-internal (instant status report)
+          if (cmd === "vpsstatus") {
+            const alive = isSessionAlive(state);
+            const gwH = Math.round((Date.now() - gatewayStartTime) / 3600_000);
+            const sessMin = alive ? Math.round((Date.now() - state.lastStartTime) / 60_000) : 0;
+            const idleMs = state.lastActivityTime > 0 ? Date.now() - state.lastActivityTime : 0;
+            const idleStr = idleMs < 60_000 ? `${Math.round(idleMs / 1000)}s` : `${Math.round(idleMs / 60_000)}min`;
+            const tool = state.activeToolUseId ? state.activeToolUseId.slice(0, 12) : "none";
+            const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+            tgFetch("sendMessage", {
+              chat_id: msg.chatId,
+              text: [
+                `Gateway: ${gwH}h uptime, ${memMB}MB RAM`,
+                `Session: ${alive ? `active ${sessMin}min` : "dead"} [${state.currentSessionId?.slice(0, 8) ?? "-"}]`,
+                `Idle: ${idleStr} | Tool: ${tool}`,
+                `Failures: ${state.consecutiveFailures} | Model: opus-1m high`,
+              ].join("\n"),
+            }).catch(() => {});
             continue;
           }
 
