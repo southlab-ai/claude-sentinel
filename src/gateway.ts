@@ -1007,6 +1007,14 @@ async function run() {
             continue;
           }
 
+          // CLI-internal commands that should never be routed from Telegram
+          const cliOnlyCommands = new Set(["exit", "quit", "clear", "compact", "config", "init", "login", "logout", "doctor", "permissions", "terminal-setup", "listen", "review", "cost", "vim", "fast"]);
+          if (cliOnlyCommands.has(cmd)) {
+            // Treat as regular text message
+            messages.push(msg);
+            continue;
+          }
+
           // Route to CLI if command is available
           if (state.availableCommands.has(cmd) || (state.availableCommands.size === 0 && !isSessionAlive(state))) {
             if (isSessionAlive(state)) {
