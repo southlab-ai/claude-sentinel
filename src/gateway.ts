@@ -1,5 +1,37 @@
+// =============================================================================
+// TELEGRAM GATEWAY — Persistent Claude Code session manager
+// =============================================================================
+//
+// Architecture: This process runs as a systemd service and manages the lifecycle
+// of a single Claude Code CLI session. It polls Telegram for messages, spawns
+// Claude with --input-format stream-json, and routes responses back to Telegram.
+//
+// Key design decisions:
+// - Single persistent session (not one-shot per message) for conversation continuity
+// - Context injected via --append-system-prompt (identity, compact, protocols, messages)
+// - Watchdog system detects stuck tool calls and can kill/respawn the session
+// - Subagent monitor handles Agent tool calls that finish but don't deliver results
+//
+// Incident history (13-abr-2026):
+// - E2BIG crash: compact_failed=true loaded 9999 msgs → exceeded 128KB ARG_MAX
+// - Fix: msgLimit capped to 100 + buildContext() hard-capped to 80KB total bytes
+// - /check was mute during incident because it only worked with a live session
+// - Fix: /check now responds inline via tgFetch, independent of session state
+// - Duplicate gateway processes ran for 5+ hours without detection
+// - Fix: gateway.pid lock with process-name verification
+// - Compact failure went unnoticed for hours
+// - Fix: notifyCompactFailure() sends direct Telegram message on failure
+//
+// Security hardening (13-abr-2026 audit):
+// - allowFrom check moved BEFORE STT to prevent unauthorized OpenAI API usage
+// - Credential JSON files set to chmod 600
+// - PRAGMA busy_timeout=5000 prevents SQLITE_BUSY on concurrent access
+// - LLM hook auto-creation blocked in compact-job.ts (RCE prevention)
+// - Path traversal protection on all LLM-generated file operations
+// =============================================================================
+
 import { Database } from "bun:sqlite";
-import { readFileSync, existsSync, appendFileSync, readdirSync, statSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, appendFileSync, readdirSync, statSync, unlinkSync } from "fs";
 import { join } from "path";
 import { spawn, spawnSync, type ChildProcess } from "child_process";
 
@@ -10,6 +42,10 @@ const ACCESS_FILE = join(STATE_DIR, "access.json");
 const DB_FILE = join(STATE_DIR, "history.db");
 const COMPACT_FILE = join(STATE_DIR, "session-compact.md");
 const IDENTITY_FILE = join(STATE_DIR, "identity.md");
+const SENTIMENT_FILE = join(STATE_DIR, "sentiment.md");
+const NOTE_FILE = join(STATE_DIR, "note_for_next_session.md");
+const PROTOCOLS_DIR = join(STATE_DIR, "protocols");
+const PID_FILE = join(STATE_DIR, "gateway.pid");
 
 const TOKEN = readFileSync(ENV_FILE, "utf-8")
   .match(/TELEGRAM_BOT_TOKEN=(.+)/)?.[1]
@@ -26,6 +62,10 @@ const OPENAI_API_KEY = readFileSync(ENV_FILE, "utf-8")
 const API = `https://api.telegram.org/bot${TOKEN}`;
 
 // --- Backoff config ---
+// Exponential backoff prevents spawn-fail loops (root cause of 5h incident).
+// After 10 consecutive failures, the gateway exits entirely — systemd Restart=always
+// will restart it, but the delay prevents runaway resource consumption.
+// healthReset: if a session runs >10min, we consider it healthy and reset counters.
 const BACKOFF = {
   initial: 5_000,
   max: 300_000,
@@ -36,6 +76,9 @@ const BACKOFF = {
 };
 
 // --- OpenAI STT (gpt-4o-mini-transcribe) ---
+// Voice/audio messages from Telegram are transcribed via OpenAI's API.
+// The access check runs BEFORE this function is called (since 13-abr-2026 audit)
+// to prevent unauthorized users from burning OpenAI credits with spam audio.
 async function transcribeAudio(fileId: string): Promise<string | null> {
   if (!OPENAI_API_KEY) {
     console.error("[gateway] No OPENAI_API_KEY, skipping transcription");
@@ -77,8 +120,14 @@ async function transcribeAudio(fileId: string): Promise<string | null> {
 }
 
 // --- SQLite ---
+// WAL mode allows concurrent reads during writes (gateway reads while compact-job writes).
+// busy_timeout=5000: wait up to 5s for a lock instead of failing immediately with SQLITE_BUSY.
+// This prevents silent data loss when compact-job's DELETE runs during gateway's INSERT.
+// (Issue #3 from 13-abr-2026 audit: race between gateway INSERT and compact-job DELETE)
 const db = new Database(DB_FILE);
 db.run("PRAGMA journal_mode=WAL");
+db.run("PRAGMA busy_timeout = 5000");
+let walInsertCount = 0;
 db.run(`
   CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,6 +161,8 @@ function setState(key: string, value: string) {
 }
 
 // --- Access control ---
+// Re-reads access.json on every poll cycle (~30s) so changes take effect without restart.
+// Managed exclusively via /telegram:access skill — never edited directly (enforced by hook).
 function loadAllowList(): string[] {
   if (!existsSync(ACCESS_FILE)) return [];
   try {
@@ -136,6 +187,14 @@ function saveMessage(
     username,
     content
   );
+  // WAL auto-checkpoint every 100 inserts. Without this, the WAL file grew to 4MB+
+  // during the 13-abr incident (no automatic checkpoint triggered). PASSIVE mode is
+  // safe to run during reads — it checkpoints what it can without blocking.
+  walInsertCount++;
+  if (walInsertCount >= 100) {
+    db.run("PRAGMA wal_checkpoint(PASSIVE)");
+    walInsertCount = 0;
+  }
 }
 
 interface HistoryRow {
@@ -178,6 +237,13 @@ function isClaudeChannelRunning(): boolean {
 }
 
 // --- Build context for new session ---
+// Assembles system prompt context from multiple files: identity, sentiment, compact summary,
+// one-time notes, behavioral protocols, and recent message history.
+// CRITICAL: This entire string becomes a single --append-system-prompt CLI argument.
+// Linux limits individual args to MAX_ARG_STRLEN=128KB. The 80KB byte cap at the end
+// ensures we never exceed this, regardless of how large individual components grow.
+// The cap was added after the 13-abr-2026 E2BIG incident where 9999 messages caused
+// the execve() call to fail, crashing the gateway into a 5-hour spawn-fail loop.
 function buildContext(): string {
   const parts: string[] = [];
 
@@ -188,6 +254,13 @@ function buildContext(): string {
     } catch {}
   }
 
+  if (existsSync(SENTIMENT_FILE)) {
+    try {
+      const sentiment = readFileSync(SENTIMENT_FILE, "utf-8").trim();
+      if (sentiment) parts.push(sentiment);
+    } catch {}
+  }
+
   if (existsSync(COMPACT_FILE)) {
     try {
       const compact = readFileSync(COMPACT_FILE, "utf-8").trim();
@@ -195,7 +268,40 @@ function buildContext(): string {
     } catch {}
   }
 
-  const messages = getLastMessages(30).reverse();
+  if (existsSync(NOTE_FILE)) {
+    try {
+      const note = readFileSync(NOTE_FILE, "utf-8").trim();
+      if (note) {
+        parts.push(`Nota de tu subconsciente (del último compact):\n${note}`);
+        unlinkSync(NOTE_FILE);
+      }
+    } catch {}
+  }
+
+  // Load behavioral protocols from subconscious
+  if (existsSync(PROTOCOLS_DIR)) {
+    try {
+      const protoFiles = readdirSync(PROTOCOLS_DIR).filter(f => f.endsWith(".md")).sort();
+      if (protoFiles.length > 0) {
+        const protocols = protoFiles.map(f => {
+          const c = readFileSync(join(PROTOCOLS_DIR, f), "utf-8").trim();
+          return `[${f}]\n${c}`;
+        }).join("\n\n");
+        parts.push(`Protocolos de comportamiento (creados por tu subconsciente para mejorar tu rendimiento):\n${protocols}`);
+      }
+    } catch {}
+  }
+
+  // Fallback: if compact failed, the session-compact.md is stale/missing, so we load
+  // more raw messages to compensate. Capped at 100 (was 9999 pre-incident) to prevent
+  // E2BIG. The 80KB byte cap below is the ultimate safety net regardless of message count.
+  const compactFailed = getState("compact_failed") === "true";
+  const msgLimit = compactFailed ? 100 : 30;
+  if (compactFailed) {
+    console.log("[gateway] compact_failed flag detected — loading last 100 messages as fallback (capped to prevent E2BIG)");
+  }
+
+  const messages = getLastMessages(msgLimit).reverse();
   if (messages.length > 0) {
     const formatted = messages
       .map((m) => {
@@ -204,10 +310,29 @@ function buildContext(): string {
         return `[${time}] ${who}: ${m.content}`;
       })
       .join("\n");
-    parts.push(`Últimas conversaciones de Telegram:\n${formatted}`);
+    const label = compactFailed
+      ? `⚠️ COMPACT FAILED — loading all ${messages.length} raw messages as fallback:\n`
+      : `Últimas conversaciones de Telegram:\n`;
+    parts.push(`${label}${formatted}`);
   }
 
-  return parts.join("\n\n");
+  let result = parts.join("\n\n");
+
+  // Hard cap at 80KB to prevent E2BIG. Linux MAX_ARG_STRLEN = 128KB for a single arg.
+  // We leave ~48KB headroom for env vars and other CLI args.
+  // Truncation removes from the end (messages), preserving identity and compact summary.
+  const MAX_CONTEXT_BYTES = 80 * 1024;
+  if (Buffer.byteLength(result, "utf-8") > MAX_CONTEXT_BYTES) {
+    console.log(`[gateway] Context too large (${Buffer.byteLength(result, "utf-8")} bytes), truncating to ${MAX_CONTEXT_BYTES} bytes`);
+    // Truncate from the end (messages are the most expendable part)
+    while (Buffer.byteLength(result, "utf-8") > MAX_CONTEXT_BYTES && result.length > 1000) {
+      // Remove last 10% of characters
+      result = result.slice(0, Math.floor(result.length * 0.9));
+    }
+    result += "\n\n[... context truncated to fit ARG_MAX safely ...]";
+  }
+
+  return result;
 }
 
 // --- Message types ---
@@ -235,9 +360,21 @@ function formatAsChannelTag(m: TelegramMessage): string {
 }
 
 // --- Spawn persistent Claude session ---
-// contextMode: "full" = identity + compact + 30 msgs (default)
-//              "light" = last 5 msgs only (for clean resume after watchdog)
-//              "none" = no extra context (for resume-continue, session has everything)
+// Three context modes control how much memory the new session receives:
+//   "full"  = identity + compact + protocols + 30 msgs (default for fresh starts)
+//   "light" = last 5 msgs only (after KILL_RESUME_CLEAN, session retains its history)
+//   "none"  = no extra context (KILL_RESUME_CONTINUE, session has everything it needs)
+//
+// Context is injected via --append-system-prompt which APPENDS to the existing system
+// prompt (CLAUDE.md, channel plugin instructions). Using --system-prompt instead would
+// OVERWRITE the defaults and break the channel plugin. This distinction is critical.
+//
+// The session uses stream-json for bidirectional communication:
+// - stdin: JSON messages (user messages, tool results, slash commands)
+// - stdout: JSON events (assistant messages, tool use, system events)
+//
+// PATH includes both .local/bin (where claude CLI lives) and .bun/bin (where bun lives).
+// These are different locations — mixing them up caused the cron failure in the incident.
 function spawnPersistentSession(fresh = false, contextMode: "full" | "light" | "none" = "full"): ChildProcess {
   const args = [
     "-p",
@@ -285,7 +422,7 @@ function spawnPersistentSession(fresh = false, contextMode: "full" | "light" | "
     env: {
       ...process.env,
       HOME: process.env.HOME,
-      PATH: `/usr/local/bin:/home/claude/.local/bin:${process.env.PATH}`,
+      PATH: `/usr/local/bin:/home/claude/.local/bin:/home/claude/.bun/bin:${process.env.PATH}`,
     },
   });
 
@@ -293,6 +430,11 @@ function spawnPersistentSession(fresh = false, contextMode: "full" | "light" | "
 }
 
 // --- Typing indicator ---
+// Sends "typing..." indicator to Telegram every 4s while Claude is processing.
+// stopTyping() is called in: reply events, result events, proc.on("exit"), proc.on("error").
+// The exit/error handlers were added after the audit found that a crash would leave
+// the typing indicator running indefinitely, misleading the user into thinking the bot
+// was still processing. (Issue #16 from 13-abr-2026 audit)
 let typingInterval: ReturnType<typeof setInterval> | null = null;
 let typingChatId: string | null = null;
 
@@ -373,7 +515,9 @@ function handleStreamEvent(event: any, state: SupervisorState) {
 
     // Register commands in Telegram Bot API (auto-updates on plugin changes)
     const botCommands = [
-      { command: "check", description: "Watchdog diagnostic" },
+      { command: "check", description: "Quick status check" },
+      { command: "health", description: "Full telemetry report" },
+      { command: "reboot", description: "Force watchdog diagnostic" },
       { command: "vpsstatus", description: "Quick VPS/session status" },
       ...cmds
         .filter((c: string) => !c.includes(":"))  // Telegram doesn't allow : in commands
@@ -457,6 +601,11 @@ interface SupervisorState {
 }
 
 // --- Subagent file monitor ---
+// When Claude spawns an Agent subagent, the parent session blocks waiting for the result.
+// If the subagent finishes but the result never gets delivered (IPC failure), or if the
+// subagent hangs for >10 minutes, this monitor reads the subagent's JSONL file directly
+// and injects a synthetic tool_result into the parent session's stdin to unblock it.
+// This prevents the common "Agent finished but parent is stuck waiting" failure mode.
 const SUBAGENT_TIMEOUT_MS = 10 * 60 * 1000; // 10 min idle = probably dead
 
 function startSubagentMonitor(state: SupervisorState) {
@@ -572,6 +721,20 @@ function stopSubagentMonitor(state: SupervisorState) {
 }
 
 // --- Watchdog (fallback) ---
+// Last-resort diagnostic system for stuck sessions. Spawns a separate one-shot Claude
+// instance that investigates the stuck session (reads JSONL, checks processes) and writes
+// a decision to /tmp/watchdog-action. Decisions:
+// - WAIT: subagent is still working, do nothing
+// - KILL_RESUME_CLEAN: kill + resume WITHOUT "continue" (prevents auto-acting on unanswered questions)
+// - KILL_RESUME_CONTINUE: kill + resume WITH "continue" (auto-retry explicitly requested tasks)
+// - KILL_FRESH: kill + compact + fresh start (for bloated or corrupt sessions)
+//
+// Auto-trigger: 20 min no activity with a pending tool call.
+// Manual trigger: /check (if tool stuck >60s) or /reboot (unconditional).
+//
+// NOTE: The watchdog has two --model flags (lines ~713-717). The second one (sonnet)
+// overrides the first (opus). This is a known pre-existing issue — the watchdog runs
+// on Sonnet, which is sufficient for diagnostic analysis.
 const WATCHDOG_TIMEOUT_MS = 20 * 60 * 1000; // 20 min no activity
 
 async function spawnWatchdogAgent(state: SupervisorState): Promise<void> {
@@ -653,7 +816,7 @@ Subagent received all WebSearch results 4 hours ago but never generated response
       env: {
         ...process.env,
         HOME: process.env.HOME,
-        PATH: `/usr/local/bin:/home/claude/.local/bin:${process.env.PATH}`,
+        PATH: `/usr/local/bin:/home/claude/.local/bin:/home/claude/.bun/bin:${process.env.PATH}`,
       },
     });
 
@@ -726,7 +889,10 @@ Subagent received all WebSearch results 4 hours ago but never generated response
 }
 
 // --- Telegram polling ---
-let globalCheckRequested = false;
+// Long-polls Telegram every 30s. Access control runs FIRST, before any media processing.
+// This order was changed in the 13-abr-2026 audit (Issue #9): previously, STT transcription
+// ran BEFORE the access check, meaning unauthorized voice messages burned OpenAI API credits.
+// Now: unauthorized users get their raw text saved (audit trail) but no STT, no forwarding.
 
 let offset = parseInt(getState("polling_offset") ?? "0", 10);
 
@@ -749,6 +915,19 @@ async function pollTelegram(): Promise<TelegramMessage[]> {
     const msg = update.message;
     if (!msg?.from) continue;
 
+    const senderId = String(msg.from.id);
+    const chatId = String(msg.chat.id);
+    const username = msg.from.username ?? senderId;
+
+    // Access check FIRST — before STT to avoid wasting OpenAI credits on unauthorized users
+    if (!allowList.includes(senderId)) {
+      const rawText = msg.text ?? msg.caption ?? "(unauthorized media)";
+      saveMessage(chatId, "user", username, rawText); // audit trail with raw text only
+      console.log(`[gateway] Ignored message from ${senderId} (not in allowlist)`);
+      continue;
+    }
+
+    // Authorized user — now process media and STT
     let text = msg.text ?? msg.caption ?? "";
     let attachment: TelegramMessage["attachment"] = undefined;
 
@@ -788,18 +967,9 @@ async function pollTelegram(): Promise<TelegramMessage[]> {
 
     if (!text && !attachment) continue;
 
-    const senderId = String(msg.from.id);
-    const chatId = String(msg.chat.id);
-    const username = msg.from.username ?? senderId;
-
-    // Always save to history
+    // Save to history (authorized user, full content including transcription)
     saveMessage(chatId, "user", username, text);
-
-    // Check access
-    if (!allowList.includes(senderId)) {
-      console.log(`[gateway] Ignored message from ${senderId} (not in allowlist)`);
-      continue;
-    }
+    setState("last_chat_id", chatId); // track for compact failure notifications
 
     console.log(`[gateway] Message from @${username}: ${text.slice(0, 80)}`);
     pendingMessages.push({
@@ -815,15 +985,72 @@ async function pollTelegram(): Promise<TelegramMessage[]> {
   return pendingMessages;
 }
 
+// --- PID lock ---
+// Prevents duplicate gateway processes (caused 5h of competing spawns in the incident).
+// On startup, checks if gateway.pid contains a live PID:
+// - Dead PID → stale lock, take over (handles crashes, SIGKILL, reboots)
+// - Live PID of another process → PID reuse after reboot, take over (verified via ps)
+// - Live PID of gateway.ts → another gateway running, abort
+// Released on SIGINT/SIGTERM. Only deletes if PID matches ours (prevents cross-deletion).
+// Known limitation: TOCTOU race if two gateways start simultaneously (negligible in practice).
+function acquirePidLock(): boolean {
+  if (existsSync(PID_FILE)) {
+    const oldPid = parseInt(readFileSync(PID_FILE, "utf-8").trim(), 10);
+    if (!isNaN(oldPid)) {
+      try {
+        process.kill(oldPid, 0); // test if process is alive
+        // Verify it's actually a gateway process, not a PID-reuse false positive
+        const psResult = spawnSync("ps", ["-p", String(oldPid), "-o", "args="], { encoding: "utf-8" });
+        const psOutput = psResult.stdout?.trim() ?? "";
+        if (psOutput.includes("gateway.ts")) {
+          console.error(`[gateway] Another gateway is already running (PID ${oldPid}). Aborting.`);
+          return false;
+        } else {
+          console.log(`[gateway] PID ${oldPid} is alive but not a gateway process ("${psOutput.slice(0, 60)}"). Taking over.`);
+        }
+      } catch {
+        console.log(`[gateway] Stale PID file found (PID ${oldPid} dead). Taking over.`);
+      }
+    }
+  }
+  writeFileSync(PID_FILE, String(process.pid));
+  console.log(`[gateway] PID lock acquired: ${process.pid}`);
+  return true;
+}
+
+function releasePidLock() {
+  try {
+    if (existsSync(PID_FILE)) {
+      const pid = parseInt(readFileSync(PID_FILE, "utf-8").trim(), 10);
+      if (pid === process.pid) {
+        unlinkSync(PID_FILE);
+        console.log("[gateway] PID lock released.");
+      }
+    }
+  } catch {}
+}
+
+if (!acquirePidLock()) {
+  process.exit(1);
+}
+
 // --- Main supervisor loop ---
+// Core event loop: poll Telegram → route commands → manage session lifecycle.
+// Key behaviors:
+// - Defers to Desktop Claude sessions (avoids conflicts when user has terminal open)
+// - Kills idle sessions after 30min to free resources (will resume on next message)
+// - Auto-triggers watchdog after 20min of tool inactivity
+// - Exits after 10 consecutive spawn failures (systemd restarts the service)
 let running = true;
 
 process.on("SIGINT", () => {
   running = false;
+  releasePidLock();
   console.log("[gateway] Shutting down...");
 });
 process.on("SIGTERM", () => {
   running = false;
+  releasePidLock();
   console.log("[gateway] Shutting down...");
 });
 
@@ -835,12 +1062,12 @@ function runCompactJob() {
   console.log("[gateway] Running compact job...");
   const result = spawnSync("bun", ["run", join(STATE_DIR, "compact-job.ts")], {
     encoding: "utf-8",
-    timeout: 120_000,
+    timeout: 660_000, // 11 min (compact has 5min timeout x2 attempts + overhead)
     cwd: process.env.HOME,
     env: {
       ...process.env,
       HOME: process.env.HOME,
-      PATH: `/usr/local/bin:/home/claude/.local/bin:${process.env.PATH}`,
+      PATH: `/usr/local/bin:/home/claude/.local/bin:/home/claude/.bun/bin:${process.env.PATH}`,
     },
   });
   if (result.status === 0) {
@@ -852,6 +1079,7 @@ function runCompactJob() {
 
 function setupExitHandler(proc: ChildProcess, state: SupervisorState) {
   proc.on("exit", (code) => {
+    stopTyping();
     stopSubagentMonitor(state);
     const uptime = Date.now() - state.lastStartTime;
     console.log(`[gateway] Session exited code=${code} uptime=${Math.round(uptime / 1000)}s`);
@@ -884,6 +1112,7 @@ function setupExitHandler(proc: ChildProcess, state: SupervisorState) {
   });
 
   proc.on("error", (err) => {
+    stopTyping();
     console.error(`[gateway] Failed to spawn Claude: ${err.message}`);
     state.proc = null;
   });
@@ -933,31 +1162,7 @@ async function run() {
       const idleMs = state.lastActivityTime > 0 ? Date.now() - state.lastActivityTime : 0;
       const autoTrigger = state.activeToolUseId && idleMs > WATCHDOG_TIMEOUT_MS;
 
-      if (globalCheckRequested) {
-        globalCheckRequested = false;
-
-        if (state.activeToolUseId && idleMs > 60_000) {
-          // Tool stuck for 1+ min — run full watchdog diagnostic
-          state.watchdogRunning = true;
-          spawnWatchdogAgent(state).finally(() => {
-            state.watchdogRunning = false;
-          });
-        } else {
-          // Session healthy — just report status
-          const uptimeMin = Math.round((Date.now() - state.lastStartTime) / 60_000);
-          const idleSec = Math.round(idleMs / 1000);
-          const status = state.activeToolUseId
-            ? `Active (tool running, idle ${idleSec}s)`
-            : `Active (idle ${idleSec}s)`;
-          const chatId = getState("last_chat_id");
-          if (chatId) {
-            tgFetch("sendMessage", {
-              chat_id: chatId,
-              text: `Session: ${state.currentSessionId?.slice(0, 8) ?? "?"}\nUptime: ${uptimeMin}min\nStatus: ${status}\nModel: opus-1m`,
-            }).catch(() => {});
-          }
-        }
-      } else if (autoTrigger) {
+      if (autoTrigger) {
         // Auto watchdog — 20 min no activity with pending tool
         state.watchdogRunning = true;
         spawnWatchdogAgent(state).finally(() => {
@@ -979,10 +1184,75 @@ async function run() {
         if (trimmed.startsWith("/")) {
           const cmd = trimmed.split(/\s+/)[0].slice(1).toLowerCase();
 
-          // /check is gateway-internal (watchdog/status)
+          // /check: fast-path health check (gateway-internal, never forwarded to Claude session).
+          // Pre-incident: only set a flag consumed inside isSessionAlive() → silent when session dead.
+          // Post-fix: responds INLINE via tgFetch regardless of session state.
+          // Also triggers watchdog diagnostic if a tool has been stuck >60s (activeToolUseId + idle).
           if (cmd === "check") {
-            globalCheckRequested = true;
-            setState("last_chat_id", msg.chatId);
+            const alive = isSessionAlive(state);
+            const gwH = Math.round((Date.now() - gatewayStartTime) / 3600_000);
+            const sessMin = alive ? Math.round((Date.now() - state.lastStartTime) / 60_000) : 0;
+            const idleMs = state.lastActivityTime > 0 ? Date.now() - state.lastActivityTime : 0;
+            const idleStr = idleMs < 60_000 ? `${Math.round(idleMs / 1000)}s` : `${Math.round(idleMs / 60_000)}min`;
+            const tool = state.activeToolUseId ? state.activeToolUseId.slice(0, 12) : "none";
+            const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+            const compactFlag = getState("compact_failed") === "true" ? "⚠️ YES" : "OK";
+            const walSize = (() => { try { return Math.round(statSync(DB_FILE + "-wal").size / 1024); } catch { return 0; } })();
+
+            // Always respond with status first (works even with dead session)
+            const statusLines = [
+              `🔍 Health Check`,
+              `Gateway: ${gwH}h uptime | PID ${process.pid} | ${memMB}MB RAM`,
+              `Session: ${alive ? `✅ active ${sessMin}min` : "❌ dead"} [${state.currentSessionId?.slice(0, 8) ?? "-"}]`,
+              `Idle: ${idleStr} | Tool: ${tool}`,
+              `Failures: ${state.consecutiveFailures} | compact_failed: ${compactFlag}`,
+              `WAL: ${walSize}KB | Model: opus-1m`,
+            ];
+
+            // If session alive with a stuck tool (>60s), also trigger watchdog diagnostic
+            if (alive && state.activeToolUseId && idleMs > 60_000 && !state.watchdogRunning) {
+              statusLines.push(`⚠️ Tool stuck ${Math.round(idleMs / 1000)}s — launching watchdog diagnostic...`);
+              state.watchdogRunning = true;
+              spawnWatchdogAgent(state).finally(() => {
+                state.watchdogRunning = false;
+              });
+            }
+
+            tgFetch("sendMessage", {
+              chat_id: msg.chatId,
+              text: statusLines.join("\n"),
+            }).catch(() => {});
+            continue;
+          }
+
+          // /reboot: unconditional watchdog trigger (added post-audit per Jorge's request).
+          // Unlike /check which only triggers watchdog if tool stuck >60s, /reboot forces
+          // a full diagnostic regardless. If session is dead, forces a fresh spawn instead.
+          if (cmd === "reboot") {
+            const alive = isSessionAlive(state);
+            if (!alive) {
+              tgFetch("sendMessage", {
+                chat_id: msg.chatId,
+                text: "🔄 No hay sesión activa. Forzando spawn fresh...",
+              }).catch(() => {});
+              state.resumeFailed = true;
+              state.nextContextMode = "full";
+              // Session will be spawned by the main loop on next iteration
+            } else if (state.watchdogRunning) {
+              tgFetch("sendMessage", {
+                chat_id: msg.chatId,
+                text: "⚠️ Watchdog ya está corriendo. Esperá a que termine.",
+              }).catch(() => {});
+            } else {
+              tgFetch("sendMessage", {
+                chat_id: msg.chatId,
+                text: "🔄 Forzando watchdog diagnóstico...",
+              }).catch(() => {});
+              state.watchdogRunning = true;
+              spawnWatchdogAgent(state).finally(() => {
+                state.watchdogRunning = false;
+              });
+            }
             continue;
           }
 
@@ -1007,11 +1277,95 @@ async function run() {
             continue;
           }
 
-          // CLI-internal commands that should never be routed from Telegram
-          const cliOnlyCommands = new Set(["exit", "quit", "clear", "compact", "config", "init", "login", "logout", "doctor", "permissions", "terminal-setup", "listen", "review", "cost", "vim", "fast"]);
-          if (cliOnlyCommands.has(cmd)) {
-            // Treat as regular text message
-            messages.push(msg);
+          // /health is a comprehensive telemetry report — works even without a live session
+          if (cmd === "health") {
+            const alive = isSessionAlive(state);
+            const gwUptime = Math.round((Date.now() - gatewayStartTime) / 1000);
+            const gwH = Math.floor(gwUptime / 3600);
+            const gwM = Math.floor((gwUptime % 3600) / 60);
+            const sessMin = alive ? Math.round((Date.now() - state.lastStartTime) / 60_000) : 0;
+            const idleMs = state.lastActivityTime > 0 ? Date.now() - state.lastActivityTime : 0;
+            const idleStr = idleMs < 60_000 ? `${Math.round(idleMs / 1000)}s` : `${Math.round(idleMs / 60_000)}min`;
+            const tool = state.activeToolUseId ? state.activeToolUseId.slice(0, 16) : "none";
+            const memMB = Math.round(process.memoryUsage().rss / 1024 / 1024);
+            const heapMB = Math.round(process.memoryUsage().heapUsed / 1024 / 1024);
+
+            // State flags
+            const compactFlag = getState("compact_failed") === "true" ? "⚠️ TRUE" : "✅ false";
+            const lastCompactTs = getState("last_compact_ts") ?? "never";
+            const sessionId = state.currentSessionId?.slice(0, 12) ?? "none";
+
+            // DB + WAL sizes
+            const dbSize = (() => { try { return Math.round(statSync(DB_FILE).size / 1024); } catch { return 0; } })();
+            const walSize = (() => { try { return Math.round(statSync(DB_FILE + "-wal").size / 1024); } catch { return 0; } })();
+
+            // Last message processed
+            const lastMsg = (() => {
+              try {
+                const row = db.query("SELECT ts, role, content FROM messages ORDER BY id DESC LIMIT 1").get() as any;
+                if (row) return `[${row.ts}] ${row.role}: ${(row.content || "").slice(0, 60)}`;
+              } catch {}
+              return "none";
+            })();
+
+            // Message count
+            const msgCount = (() => {
+              try {
+                const row = db.query("SELECT COUNT(*) as c FROM messages").get() as any;
+                return row?.c ?? 0;
+              } catch { return 0; }
+            })();
+
+            // PID lock
+            const pidFile = join(STATE_DIR, "gateway.pid");
+            const pidStatus = (() => {
+              try {
+                if (existsSync(pidFile)) {
+                  const pid = readFileSync(pidFile, "utf-8").trim();
+                  return `${pid} (${pid === String(process.pid) ? "self" : "OTHER!"})`;
+                }
+                return "none";
+              } catch { return "error"; }
+            })();
+
+            tgFetch("sendMessage", {
+              chat_id: msg.chatId,
+              text: [
+                `📊 HEALTH REPORT`,
+                ``,
+                `🔧 Gateway`,
+                `  PID: ${process.pid} | Lock: ${pidStatus}`,
+                `  Uptime: ${gwH}h${gwM}m | RAM: ${memMB}MB (heap ${heapMB}MB)`,
+                ``,
+                `🧠 Session`,
+                `  Status: ${alive ? "✅ ALIVE" : "❌ DEAD"} [${sessionId}]`,
+                `  Uptime: ${sessMin}min | Idle: ${idleStr}`,
+                `  Tool: ${tool}`,
+                `  Failures: ${state.consecutiveFailures} | Backoff: ${state.backoffMs}ms`,
+                ``,
+                `💾 Database`,
+                `  Size: ${dbSize}KB | WAL: ${walSize}KB`,
+                `  Messages: ${msgCount}`,
+                `  Last: ${lastMsg}`,
+                ``,
+                `🚩 Flags`,
+                `  compact_failed: ${compactFlag}`,
+                `  last_compact: ${lastCompactTs}`,
+                `  resumeFailed: ${state.resumeFailed}`,
+                `  watchdog: ${state.watchdogRunning ? "RUNNING" : "idle"}`,
+                `  contextMode: ${state.nextContextMode}`,
+              ].join("\n"),
+            }).catch(() => {});
+            continue;
+          }
+
+          // Interactive TUI commands that cannot work over Telegram (require terminal input)
+          const interactiveOnlyCommands = new Set(["config", "permissions", "terminal-setup", "vim", "voice"]);
+          if (interactiveOnlyCommands.has(cmd)) {
+            await tgFetch("sendMessage", {
+              chat_id: msg.chatId,
+              text: `⚠️ /${cmd} requires an interactive terminal and can't run from Telegram.`,
+            }).catch(() => {});
             continue;
           }
 
@@ -1076,7 +1430,9 @@ async function run() {
             }
           }
 
-          // Spawn persistent session
+          // Spawn persistent session.
+          // state.resumeFailed=true forces fresh start (new session, no --resume).
+          // state.nextContextMode controls how much context to inject (set by watchdog or exit handler).
           console.log("[gateway] Spawning persistent Claude session...");
           state.hitRateLimit = false;
           state.lastStartTime = Date.now();
@@ -1093,7 +1449,8 @@ async function run() {
           // Wait a moment for init before sending
           await new Promise((r) => setTimeout(r, 2_000));
 
-          // Inject failure context from watchdog if available
+          // Inject failure context from watchdog. This goes via STDIN as a user message
+          // (not --append-system-prompt) so Claude actively responds to it and informs the user.
           if (state.lastFailureContext) {
             const contextMsg = JSON.stringify({
               type: "user",
@@ -1124,7 +1481,8 @@ async function run() {
     }
   }
 
-  // Graceful shutdown: kill child process
+  // Graceful shutdown: SIGTERM first, wait 5s, then SIGKILL if still alive.
+  // db.close() runs after to ensure WAL is checkpointed.
   if (state.proc && state.proc.exitCode === null) {
     console.log("[gateway] Sending SIGTERM to Claude process...");
     state.proc.kill("SIGTERM");
